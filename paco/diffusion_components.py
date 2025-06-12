@@ -29,11 +29,23 @@ class VectorQuantizer(nn.Module):
             loss: VQ loss
             encoding_indices: Indices used for quantization
         """
-        # Ensure z is in [B, H, C] format
-        if z.dim() == 3 and z.size(1) == self.embed_dim:
-            z = z.permute(0, 2, 1)  # [B, C, H] -> [B, H, C]
+        # 确保输入张量的形状和维度处理
+        original_shape = z.shape
         
-        z_flattened = z.view(-1, self.embed_dim)
+        # 处理输入张量格式 - 统一为 [B, H, C] 格式
+        if z.dim() == 3:
+            if z.size(-1) != self.embed_dim:
+                # 如果最后一个维度不是embed_dim，假设是 [B, C, H] 格式
+                if z.size(1) == self.embed_dim:
+                    z = z.permute(0, 2, 1)  # [B, C, H] -> [B, H, C]
+                else:
+                    raise ValueError(f"Input tensor shape {z.shape} is not compatible with embed_dim {self.embed_dim}")
+        else:
+            raise ValueError(f"Input tensor must be 3D, got {z.dim()}D")
+        
+        # 确保张量是连续的，然后reshape
+        z = z.contiguous()
+        z_flattened = z.reshape(-1, self.embed_dim)
         
         # distances from z to embeddings e_j (z - e)^2 = z^2 + e^2 - 2 e * z
         d = torch.sum(z_flattened ** 2, dim=1, keepdim=True) + \
@@ -49,35 +61,52 @@ class VectorQuantizer(nn.Module):
         # preserve gradients
         z_q = z + (z_q - z).detach()
         
+        # 恢复原始形状
+        if len(original_shape) == 3 and original_shape[1] == self.embed_dim:
+            # 如果原始输入是 [B, C, H] 格式，转换回去
+            z_q = z_q.permute(0, 2, 1)
+        
         return z_q, loss, min_encoding_indices.view(z.shape[:-1])
 
 
-class NoiseScheduler:
+class NoiseScheduler(nn.Module):
     """
     DDPM Noise Scheduler
     """
     def __init__(self, num_timesteps: int = 1000, beta_start: float = 0.0001, beta_end: float = 0.02):
+        super().__init__()
         self.num_timesteps = num_timesteps
         
-        self.betas = torch.linspace(beta_start, beta_end, num_timesteps)
-        self.alphas = 1. - self.betas
-        self.alphas_cumprod = torch.cumprod(self.alphas, dim=0)
-        self.alphas_cumprod_prev = F.pad(self.alphas_cumprod[:-1], (1, 0), value=1.0)
+        # 将所有调度器参数注册为缓冲区，这样会自动管理设备
+        betas = torch.linspace(beta_start, beta_end, num_timesteps)
+        alphas = 1. - betas
+        alphas_cumprod = torch.cumprod(alphas, dim=0)
+        alphas_cumprod_prev = F.pad(alphas_cumprod[:-1], (1, 0), value=1.0)
         
-        self.sqrt_alphas_cumprod = torch.sqrt(self.alphas_cumprod)
-        self.sqrt_one_minus_alphas_cumprod = torch.sqrt(1. - self.alphas_cumprod)
+        # 注册为缓冲区（不参与梯度计算，但会跟随模型设备变化）
+        self.register_buffer('betas', betas)
+        self.register_buffer('alphas', alphas)
+        self.register_buffer('alphas_cumprod', alphas_cumprod)
+        self.register_buffer('alphas_cumprod_prev', alphas_cumprod_prev)
+        
+        self.register_buffer('sqrt_alphas_cumprod', torch.sqrt(alphas_cumprod))
+        self.register_buffer('sqrt_one_minus_alphas_cumprod', torch.sqrt(1. - alphas_cumprod))
         
         # For sampling
-        self.sqrt_recip_alphas = torch.sqrt(1.0 / self.alphas)
-        self.sqrt_recipm1_alphas_cumprod = torch.sqrt(1.0 / self.alphas_cumprod - 1)
+        self.register_buffer('sqrt_recip_alphas', torch.sqrt(1.0 / alphas))
+        self.register_buffer('sqrt_recipm1_alphas_cumprod', torch.sqrt(1.0 / alphas_cumprod - 1))
         
         # Posterior variance
-        self.posterior_variance = self.betas * (1. - self.alphas_cumprod_prev) / (1. - self.alphas_cumprod)
+        posterior_variance = betas * (1. - alphas_cumprod_prev) / (1. - alphas_cumprod)
+        self.register_buffer('posterior_variance', posterior_variance)
 
     def add_noise(self, original_samples: torch.Tensor, noise: torch.Tensor, timesteps: torch.Tensor) -> torch.Tensor:
         """Add noise to samples"""
-        sqrt_alpha_prod = self.sqrt_alphas_cumprod[timesteps].to(original_samples.device)
-        sqrt_one_minus_alpha_prod = self.sqrt_one_minus_alphas_cumprod[timesteps].to(original_samples.device)
+        # 确保 timesteps 在 CPU 上进行索引，然后移动到目标设备
+        timesteps_cpu = timesteps.cpu()
+        
+        sqrt_alpha_prod = self.sqrt_alphas_cumprod[timesteps_cpu].to(original_samples.device)
+        sqrt_one_minus_alpha_prod = self.sqrt_one_minus_alphas_cumprod[timesteps_cpu].to(original_samples.device)
         
         # Reshape for broadcasting
         while len(sqrt_alpha_prod.shape) < len(original_samples.shape):
@@ -91,17 +120,17 @@ class NoiseScheduler:
         """Perform one denoising step"""
         t = timestep
         
-        # Get parameters
-        beta_t = self.betas[t].to(sample.device)
-        sqrt_one_minus_alpha_cumprod_t = self.sqrt_one_minus_alphas_cumprod[t].to(sample.device)
-        sqrt_recip_alphas_t = self.sqrt_recip_alphas[t].to(sample.device)
+        # Get parameters (already on correct device due to register_buffer)
+        beta_t = self.betas[t]
+        sqrt_one_minus_alpha_cumprod_t = self.sqrt_one_minus_alphas_cumprod[t]
+        sqrt_recip_alphas_t = self.sqrt_recip_alphas[t]
         
         # Compute the previous sample
         pred_original_sample = sqrt_recip_alphas_t * (sample - beta_t * model_output / sqrt_one_minus_alpha_cumprod_t)
         
         # Add noise if not the final step
         if t > 0:
-            posterior_variance_t = self.posterior_variance[t].to(sample.device)
+            posterior_variance_t = self.posterior_variance[t]
             noise = torch.randn_like(sample)
             prev_sample = pred_original_sample + torch.sqrt(posterior_variance_t) * noise
         else:
@@ -187,7 +216,7 @@ class AttentionBlock(nn.Module):
 
 class DiffusionUNet(nn.Module):
     """
-    UNet for diffusion model
+    简化的 UNet，避免复杂的跳跃连接
     """
     def __init__(self, in_channels: int, model_channels: int, out_channels: int, 
                  condition_channels: int = None, num_heads: int = 8, num_res_blocks: int = 2):
@@ -214,58 +243,37 @@ class DiffusionUNet(nn.Module):
         # Initial projection
         self.input_proj = nn.Conv1d(in_channels, model_channels, 1)
         
-        # Encoder
-        self.encoder_blocks = nn.ModuleList([
-            self._make_encoder_block(model_channels, model_channels * 2, time_embed_dim),
-            self._make_encoder_block(model_channels * 2, model_channels * 4, time_embed_dim),
+        # 简化的编码器（不使用复杂跳跃连接）
+        self.encoder = nn.ModuleList([
+            ResidualBlock(model_channels, model_channels, time_embed_dim),
+            AttentionBlock(model_channels, num_heads),
+            ResidualBlock(model_channels, model_channels * 2, time_embed_dim),
+            nn.AvgPool1d(2),
+            ResidualBlock(model_channels * 2, model_channels * 2, time_embed_dim),
+            AttentionBlock(model_channels * 2, num_heads),
         ])
         
         # Middle block
-        self.middle_block = nn.Sequential(
-            ResidualBlock(model_channels * 4, model_channels * 4, time_embed_dim),
+        self.middle = nn.ModuleList([
+            ResidualBlock(model_channels * 2, model_channels * 4, time_embed_dim),
             AttentionBlock(model_channels * 4, num_heads),
-            ResidualBlock(model_channels * 4, model_channels * 4, time_embed_dim),
-        )
+            ResidualBlock(model_channels * 4, model_channels * 2, time_embed_dim),
+        ])
         
-        # Decoder
-        self.decoder_blocks = nn.ModuleList([
-            self._make_decoder_block(model_channels * 8, model_channels * 2, time_embed_dim),  # 4*2 from skip
-            self._make_decoder_block(model_channels * 4, model_channels, time_embed_dim),      # 2*2 from skip
+        # 简化的解码器
+        self.decoder = nn.ModuleList([
+            nn.Upsample(scale_factor=2, mode='linear', align_corners=False),
+            ResidualBlock(model_channels * 2, model_channels, time_embed_dim),
+            AttentionBlock(model_channels, num_heads),
+            ResidualBlock(model_channels, model_channels, time_embed_dim),
         ])
         
         # Output
         self.output_proj = nn.Sequential(
-            nn.GroupNorm(8, model_channels * 2),  # *2 from final skip
+            nn.GroupNorm(8, model_channels),
             nn.SiLU(),
-            nn.Conv1d(model_channels * 2, out_channels, 1)
+            nn.Conv1d(model_channels, out_channels, 1)
         )
-        
-    def _make_encoder_block(self, in_channels, out_channels, time_embed_dim):
-        blocks = []
-        for i in range(self.num_res_blocks):
-            blocks.append(
-                ResidualBlock(
-                    in_channels if i == 0 else out_channels, 
-                    out_channels, 
-                    time_embed_dim
-                )
-            )
-        blocks.append(AttentionBlock(out_channels))
-        blocks.append(nn.AvgPool1d(2))  # Downsample
-        return nn.Sequential(*blocks)
-    
-    def _make_decoder_block(self, in_channels, out_channels, time_embed_dim):
-        blocks = [nn.Upsample(scale_factor=2, mode='linear', align_corners=False)]  # Upsample
-        for i in range(self.num_res_blocks):
-            blocks.append(
-                ResidualBlock(
-                    in_channels if i == 0 else out_channels,
-                    out_channels,
-                    time_embed_dim
-                )
-            )
-        blocks.append(AttentionBlock(out_channels))
-        return nn.Sequential(*blocks)
     
     def forward(self, x: torch.Tensor, timestep: torch.Tensor, condition: torch.Tensor = None) -> torch.Tensor:
         """
@@ -290,42 +298,28 @@ class DiffusionUNet(nn.Module):
                 cond = self.condition_proj(condition).transpose(1, 2)  # [B, C, N]
             h = h + cond
         
-        # Store skip connections
-        skip_connections = [h]
-        
         # Encoder
-        for block in self.encoder_blocks:
-            for layer in block:
-                if isinstance(layer, ResidualBlock):
-                    h = layer(h, t_emb)
-                else:
-                    h = layer(h)
-            skip_connections.append(h)
+        for layer in self.encoder:
+            if isinstance(layer, ResidualBlock):
+                h = layer(h, t_emb)
+            else:
+                h = layer(h)
         
         # Middle
-        for layer in self.middle_block:
+        for layer in self.middle:
             if isinstance(layer, ResidualBlock):
                 h = layer(h, t_emb)
             else:
                 h = layer(h)
         
         # Decoder
-        for i, block in enumerate(self.decoder_blocks):
-            skip = skip_connections[-(i+1)]
-            for j, layer in enumerate(block):
-                if j == 0:  # Upsample layer
-                    h = layer(h)
-                    # Adjust size to match skip connection
-                    if h.size(-1) != skip.size(-1):
-                        h = F.interpolate(h, size=skip.size(-1), mode='linear', align_corners=False)
-                    h = torch.cat([h, skip], dim=1)
-                elif isinstance(layer, ResidualBlock):
-                    h = layer(h, t_emb)
-                else:
-                    h = layer(h)
+        for layer in self.decoder:
+            if isinstance(layer, ResidualBlock):
+                h = layer(h, t_emb)
+            else:
+                h = layer(h)
         
-        # Final skip connection and output
-        h = torch.cat([h, skip_connections[0]], dim=1)
+        # Output
         output = self.output_proj(h)
         
         return output

@@ -5,6 +5,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 from timm.models.layers import DropPath, trunc_normal_
 from pointnet2_ops import pointnet2_utils
+from pytorch3d.structures import Pointclouds
+from pytorch3d.loss import chamfer_distance
+from scipy.optimize import linear_sum_assignment
 
 from . import MODELS
 from .transformer_utils import (
@@ -15,7 +18,7 @@ from .transformer_utils import (
 )
 
 from .diffusion_components import VectorQuantizer, NoiseScheduler, DiffusionUNet, CrossLevelAttention
-from .hierarchical_encoder import HierarchicalPointEncoder, HierarchicalDecoder
+from typing import List, Dict, Tuple
 class SelfAttnBlockAPI(nn.Module):
     r"""
     Self Attention Block API
@@ -616,7 +619,6 @@ class PointTransformerDecoderEntry(PointTransformerDecoder):
     def __init__(self, config, **kwargs):
         super().__init__(**dict(config))
 
-
 class DGCNN_Grouper(nn.Module):
     """
     Dynamic Graph CNN Grouper
@@ -1085,6 +1087,251 @@ class PCTransformer(nn.Module):
             plane = self.plane_pred(q).reshape(bs, -1, 3)
         return q, plane
 
+class HierarchicalPointEncoder(nn.Module):
+    """
+    层次化点云编码器，结合Point-E和Point-VQVAE思想
+    """
+    def __init__(self, config):
+        super().__init__()
+        self.num_levels = getattr(config, 'num_levels', 3)
+        self.embed_dim = config.encoder.embed_dim
+        self.codebook_size = getattr(config, 'codebook_size', 8192)
+        self.encoder_type = config.encoder_type
+        
+        # 基础编码器 (复用PaCo的组件)
+        if self.encoder_type == 'graph':
+            self.grouper = DGCNN_Grouper(k=config.group_k)
+        else:
+            self.grouper = SimpleEncoder(k=config.group_k, embed_dims=128)
+        
+        # 位置编码
+        self.pos_embed = nn.Sequential(
+            nn.Linear(3, 128),
+            nn.GELU(),
+            nn.Linear(128, self.embed_dim)
+        )
+        
+        # 特征投影
+        self.input_proj = nn.Sequential(
+            nn.Linear(self.grouper.num_features, 512),
+            nn.GELU(),
+            nn.Linear(512, self.embed_dim)
+        )
+        
+        # Transformer编码器
+        self.encoder = PointTransformerEncoderEntry(config.encoder)
+        
+        # 层次化特征金字塔
+        self.pyramid_encoders = nn.ModuleList([
+            nn.Sequential(
+                nn.Conv1d(self.embed_dim, self.embed_dim * 2, 1),
+                nn.GroupNorm(8, self.embed_dim * 2),
+                nn.GELU(),
+                nn.Conv1d(self.embed_dim * 2, self.embed_dim, 1),
+                nn.GroupNorm(8, self.embed_dim),
+                nn.GELU()
+            ) for _ in range(self.num_levels)
+        ])
+        
+        # VQ-VAE量化层 - 每个层次不同的codebook大小
+        self.vq_layers = nn.ModuleList([
+            VectorQuantizer(
+                n_embed=max(512, self.codebook_size // (2**i)),  # 递减的codebook大小
+                embed_dim=self.embed_dim,
+                beta=0.25
+            ) for i in range(self.num_levels)
+        ])
+        
+        # 层次间融合
+        self.level_fusion = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(self.embed_dim * 2, self.embed_dim),
+                nn.GELU(),
+                nn.Dropout(0.1)
+            ) for _ in range(self.num_levels - 1)
+        ])
+
+    def forward(self, xyz) -> List[Dict]:
+        """
+        前向传播
+        
+        Args:
+            xyz: 输入点云 [B, N, 7]
+        
+        Returns:
+            List of hierarchical codes
+        """
+        bs = xyz.size(0)
+        
+        # 基础特征提取
+        coor, f, normal, batch = self.grouper(xyz, self.num_centers if hasattr(self, 'num_centers') else [128, 128])
+        pe = self.pos_embed(coor)
+        x = self.input_proj(f)
+        
+        # Transformer编码
+        x = self.encoder(x + pe, coor)  # [B, M, C]
+        
+        hierarchical_codes = []
+        base_features = x
+        
+        # 生成多层次编码
+        for level in range(self.num_levels):
+            # 计算当前层次的分辨率
+            current_resolution = base_features.size(1) // (2 ** level)
+            current_resolution = max(current_resolution, 8)  # 最小分辨率
+            
+            # 下采样到当前层次分辨率
+            if current_resolution == base_features.size(1):
+                level_features = base_features
+            else:
+                # 使用自适应平均池化下采样
+                level_features = F.adaptive_avg_pool1d(
+                    base_features.transpose(1, 2), 
+                    current_resolution
+                ).transpose(1, 2)
+            
+            # 层次化特征处理
+            level_features_conv = self.pyramid_encoders[level](level_features.transpose(1, 2))
+            level_features_processed = level_features_conv.transpose(1, 2)
+            
+            # 如果不是第一层，融合上一层的信息
+            if level > 0 and len(hierarchical_codes) > 0:
+                prev_features = hierarchical_codes[-1]['features']
+                # 上采样前一层特征到当前分辨率
+                if prev_features.size(1) != current_resolution:
+                    prev_upsampled = F.interpolate(
+                        prev_features.transpose(1, 2),
+                        size=current_resolution,
+                        mode='linear',
+                        align_corners=False
+                    ).transpose(1, 2)
+                else:
+                    prev_upsampled = prev_features
+                
+                # 特征融合
+                fused_input = torch.cat([level_features_processed, prev_upsampled], dim=-1)
+                level_features_processed = self.level_fusion[level-1](fused_input)
+            
+            # VQ量化
+            quantized, vq_loss, encoding_indices = self.vq_layers[level](level_features_processed)
+            
+            hierarchical_codes.append({
+                'features': quantized,
+                'indices': encoding_indices,
+                'loss': vq_loss,
+                'level': level,
+                'resolution': current_resolution,
+                'raw_features': level_features_processed
+            })
+        
+        return hierarchical_codes
+
+
+class HierarchicalDecoder(nn.Module):
+    """
+    层次化解码器，从多层次编码重建特征
+    """
+    def __init__(self, embed_dim: int, num_levels: int):
+        super().__init__()
+        self.embed_dim = embed_dim
+        self.num_levels = num_levels
+        
+        # 上采样网络
+        self.upsample_layers = nn.ModuleList([
+            nn.Sequential(
+                nn.ConvTranspose1d(embed_dim, embed_dim, 4, stride=2, padding=1),
+                nn.GroupNorm(8, embed_dim),
+                nn.GELU(),
+                nn.Conv1d(embed_dim, embed_dim, 3, padding=1),
+                nn.GroupNorm(8, embed_dim),
+                nn.GELU()
+            ) for _ in range(num_levels - 1)
+        ])
+        
+        # 特征融合
+        self.fusion_layers = nn.ModuleList([
+            nn.Sequential(
+                nn.Conv1d(embed_dim * 2, embed_dim, 1),
+                nn.GroupNorm(8, embed_dim),
+                nn.GELU(),
+                nn.Conv1d(embed_dim, embed_dim, 3, padding=1),
+                nn.GroupNorm(8, embed_dim),
+                nn.GELU()
+            ) for _ in range(num_levels - 1)
+        ])
+        
+        # 最终输出层
+        self.output_layer = nn.Sequential(
+            nn.Conv1d(embed_dim, embed_dim * 2, 1),
+            nn.GroupNorm(8, embed_dim * 2),
+            nn.GELU(),
+            nn.Conv1d(embed_dim * 2, embed_dim, 1)
+        )
+
+    def forward(self, hierarchical_codes: List[Dict]) -> torch.Tensor:
+        """
+        从层次化编码重建特征
+        
+        Args:
+            hierarchical_codes: 层次化编码列表
+        
+        Returns:
+            重建的特征 [B, target_resolution, C]
+        """
+        # 从最粗糙的层次开始
+        current_features = hierarchical_codes[-1]['features']  # 最后一层是最粗糙的
+        target_resolution = hierarchical_codes[0]['resolution']  # 第一层是最精细的
+        
+        # 逐层上采样和融合
+        for i in range(self.num_levels - 2, -1, -1):  # 从倒数第二层开始到第一层
+            # 上采样当前特征
+            current_features_conv = current_features.transpose(1, 2)  # [B, C, N]
+            
+            if i < len(self.upsample_layers):
+                upsampled = self.upsample_layers[i](current_features_conv)
+            else:
+                upsampled = current_features_conv
+            
+            # 调整到目标分辨率
+            target_res = hierarchical_codes[i]['resolution']
+            if upsampled.size(-1) != target_res:
+                upsampled = F.interpolate(
+                    upsampled, 
+                    size=target_res, 
+                    mode='linear', 
+                    align_corners=False
+                )
+            
+            # 获取当前层的特征并融合
+            level_features = hierarchical_codes[i]['features'].transpose(1, 2)
+            
+            # 确保尺寸匹配
+            if upsampled.size(-1) != level_features.size(-1):
+                min_size = min(upsampled.size(-1), level_features.size(-1))
+                upsampled = F.interpolate(upsampled, size=min_size, mode='linear', align_corners=False)
+                level_features = F.interpolate(level_features, size=min_size, mode='linear', align_corners=False)
+            
+            # 特征融合
+            fused = torch.cat([upsampled, level_features], dim=1)
+            if i < len(self.fusion_layers):
+                current_features = self.fusion_layers[i](fused).transpose(1, 2)
+            else:
+                current_features = fused.transpose(1, 2)
+        
+        # 最终处理
+        output = self.output_layer(current_features.transpose(1, 2)).transpose(1, 2)
+        
+        # 确保输出分辨率正确
+        if output.size(1) != target_resolution:
+            output = F.interpolate(
+                output.transpose(1, 2), 
+                size=target_resolution, 
+                mode='linear', 
+                align_corners=False
+            ).transpose(1, 2)
+        
+        return output
+
 class HierarchicalPCTransformer(PCTransformer):
     """
     继承PCTransformer并添加层次化编码支持
@@ -1392,11 +1639,35 @@ class HierarchicalDiffusionPaCo(nn.Module):
                 
                 # 重新解码特征
                 if hasattr(self.base_model, 'hierarchical_decoder'):
-                    q = self.base_model.hierarchical_decoder(denoised_codes)
+                    q_decoded = self.base_model.hierarchical_decoder(denoised_codes)
+                    # 确保解码后的特征与原始 q 的尺寸匹配
+                    if q_decoded.size(1) != M:
+                        # 使用插值调整尺寸
+                        q = F.interpolate(
+                            q_decoded.transpose(1, 2), 
+                            size=M, 
+                            mode='linear', 
+                            align_corners=False
+                        ).transpose(1, 2)
+                    else:
+                        q = q_decoded
             else:
                 # 推理时可以选择使用轻量级扩散或直接使用特征
                 # 这里为了保持推理速度，直接使用特征
                 pass
+        
+        # 确保 q 和 plane 的维度匹配
+        B, M_q, C = q.shape
+        B, M_plane, _ = plane.shape
+        
+        if M_q != M_plane:
+            # 调整其中一个张量的尺寸以匹配另一个
+            min_M = min(M_q, M_plane)
+            q = q[:, :min_M, :]
+            plane = plane[:, :min_M, :]
+            M = min_M
+        else:
+            M = M_q
         
         # 3. 保持原始PaCo的后续处理流程
         global_feature = self.increase_dim(q.transpose(1, 2)).transpose(1, 2)  # B M 1024
@@ -1615,22 +1886,177 @@ class HierarchicalDiffusionPaCo(nn.Module):
 
     def get_loss(self, config, ret, class_prob, gt, gt_index, plane, plan_index):
         """
-        扩展原始PaCo的损失函数，增加扩散损失
+           计算损失函数,集成原始PaCo损失和扩散损失
+    
+        Args:
+            config: 配置对象，包含损失权重
+            ret: 元组 (predicted_planes, reconstructed_points)
+            class_prob: 分类概率张量 [B, M, 2]
+            gt: 真实点云 [B, N, 3]
+            gt_index: 真实点云索引 [B, N]
+            plane: 预测平面参数 [B, M, 4]
+            plan_index: 预测平面索引 [B, M]
+    
+        Returns:
+            包含所有损失项的字典
         """
-        # 获取原始PaCo损失
-        original_losses = super().get_loss(config, ret, class_prob, gt, gt_index, plane, plan_index)
+        predicted_planes, reconstructed_points = ret
+        batch_size, _, _ = class_prob.size()
+        device = reconstructed_points.device
+        # 初始化损失字典（原始PaCo损失项）
+        losses = {
+            "plane_chamfer_loss": 0.0,
+            "classification_loss": 0.0,
+            "chamfer_norm1_loss": 0.0,
+            "chamfer_norm2_loss": 0.0,
+            "plane_normal_loss": 0.0,
+            "repulsion_loss": 0.0
+        }
+        size_total = 0.0
+
+        # 批处理损失计算（原始PaCo逻辑）
+        for batch_idx in range(batch_size):
+            # 获取唯一的真实平面索引
+            unique_gt_indices = torch.unique(gt_index[batch_idx].int())
+            unique_gt_indices = unique_gt_indices[unique_gt_indices != -1]  # 移除无效索引
+            num_ground_truth_planes = unique_gt_indices.size(0)
+
+            if num_ground_truth_planes == 0:
+                continue
+                # 计算真实点云集合
+            ground_truth_pointclouds = [
+                gt[batch_idx, (gt_index[batch_idx] == idx)].reshape(-1, 3)
+                for idx in unique_gt_indices
+            ]
+            ground_truth_pointclouds = ground_truth_pointclouds * self.num_queries
+            ground_truth_pointclouds = Pointclouds(ground_truth_pointclouds).to(device)
+
+            # 计算重建点云集合
+            start_indices = torch.arange(self.num_queries, device=device) * self.factor
+            end_indices = start_indices + self.factor
+            reconstructed_pointclouds = [
+                reconstructed_points[batch_idx, start:end].reshape(-1, 3)
+                for start, end in zip(start_indices, end_indices)
+                ]
+            reconstructed_pointclouds = [
+                pointcloud for pointcloud in reconstructed_pointclouds for _ in range(num_ground_truth_planes)
+            ]
+            reconstructed_pointclouds = Pointclouds(reconstructed_pointclouds).to(device)
+            # 计算平面Chamfer距离
+            chamfer_distances, _ = chamfer_distance(
+                ground_truth_pointclouds, reconstructed_pointclouds,
+                point_reduction='mean', batch_reduction=None
+            )
+            plane_chamfer_distance = chamfer_distances.view(self.num_queries, num_ground_truth_planes)
+
+            # 计算平面法向量损失
+            gt_planes = plane[batch_idx, unique_gt_indices].float()
+            pred_planes = predicted_planes[batch_idx]
+            l2_loss = torch.sum((pred_planes[:, :3].unsqueeze(1) - gt_planes[:, :3].unsqueeze(0)) ** 2, dim=-1)
+            cosine_loss = 1 - F.cosine_similarity(
+                pred_planes[:, :3].unsqueeze(1), gt_planes[:, :3].unsqueeze(0), dim=-1
+            )
+            plane_normal_loss = (l2_loss + cosine_loss).view(self.num_queries, num_ground_truth_planes)
+
+            # 计算分类损失
+            classification_scores = class_prob[batch_idx]
+            object_class_loss = F.cross_entropy(
+                classification_scores,
+                torch.zeros(self.num_queries, dtype=torch.long, device=device),
+                size_average=False, reduce=False
+            ).unsqueeze(-1).expand(-1, num_ground_truth_planes)
+        
+            non_object_class_loss = F.cross_entropy(
+                classification_scores,
+                torch.ones(self.num_queries, dtype=torch.long, device=device),
+                size_average=False, reduce=False
+            ).unsqueeze(-1).expand(-1, num_ground_truth_planes)
+
+            # 计算排斥损失
+            if hasattr(self, 'repulsion') and self.repulsion:
+                reshaped_reconstructed_points = reconstructed_points[batch_idx].view(-1, self.factor, 3)
+                neighbor_indices = knn_point(
+                    self.repulsion.num_neighbors, reshaped_reconstructed_points, reshaped_reconstructed_points
+                )[:, :, 1:].long()
+            
+                grouped_points = index_points(reshaped_reconstructed_points, neighbor_indices).transpose(2, 3).contiguous() - reshaped_reconstructed_points.unsqueeze(-1)
+                distance_matrix = torch.sum(grouped_points ** 2, dim=2).clamp(min=self.repulsion.epsilon)
+                weight_matrix = torch.exp(-distance_matrix / self.repulsion.kernel_bandwidth ** 2)
+                repulsion_penalty = torch.mean(
+                    (self.repulsion.radius - distance_matrix.sqrt()) * weight_matrix,
+                    dim=(1, 2)
+                ).clamp(min=0).unsqueeze(-1).expand(-1, num_ground_truth_planes)
+            else:
+                repulsion_penalty = torch.zeros(self.num_queries, num_ground_truth_planes, device=device)
+
+            # 匈牙利分配算法进行匹配
+            cost_matrix = (
+                    object_class_loss +
+                plane_chamfer_distance * config.plane_chamfer_loss_weight +
+                repulsion_penalty * config.repulsion_loss_weight +
+                plane_normal_loss * config.plane_normal_loss_weight
+            )
+        
+            hungarian_assignment = linear_sum_assignment(cost_matrix.detach().cpu().numpy())
+            hungarian_assignment = [
+                torch.tensor(a, dtype=torch.long, device=device) for a in hungarian_assignment
+            ]
+
+            # 提取匹配的损失
+            matched_plane_chamfer_distance = plane_chamfer_distance[hungarian_assignment[0], hungarian_assignment[1]]
+            matched_plane_normal_loss = plane_normal_loss[hungarian_assignment[0], hungarian_assignment[1]]
+            matched_repulsion_penalty = repulsion_penalty[hungarian_assignment[0], 0]
+            matched_reconstructed_points = reshaped_reconstructed_points[hungarian_assignment[0]].reshape(1, -1, 3)
+            matched_object_class_loss = object_class_loss[hungarian_assignment[0], 0]
+
+            # 计算未匹配的分类损失
+            unmatched_indices = torch.tensor(
+                list(set(range(self.num_queries)) - set(hungarian_assignment[0].tolist())),
+                device=device
+            )
+            if len(unmatched_indices) > 0:
+                unmatched_class_loss = non_object_class_loss[unmatched_indices, 0] * config.non_obj_class_loss_weight
+                total_classification_loss = torch.cat([matched_object_class_loss, unmatched_class_loss])
+            else:
+                total_classification_loss = matched_object_class_loss
+
+            # 计算细粒度Chamfer损失
+            fine_chamfer_loss_1 = chamfer_distance(
+                matched_reconstructed_points, gt[batch_idx].unsqueeze(0), norm=1
+            )
+            fine_chamfer_loss_2 = chamfer_distance(
+                matched_reconstructed_points, gt[batch_idx].unsqueeze(0)
+            )
+
+            # 累积损失
+            losses["plane_chamfer_loss"] += matched_plane_chamfer_distance.sum()
+            losses["classification_loss"] += total_classification_loss.sum()
+            losses["plane_normal_loss"] += matched_plane_normal_loss.sum()
+            losses["repulsion_loss"] += matched_repulsion_penalty.sum()
+            losses["chamfer_norm1_loss"] += fine_chamfer_loss_1[0]
+            losses["chamfer_norm2_loss"] += fine_chamfer_loss_2[0]
+            size_total += num_ground_truth_planes
+         # 归一化损失
+        for k in losses.keys():
+            if k.startswith('chamfer'):
+                losses[k] /= batch_size
+            else:
+                if size_total > 0:
+                    losses[k] /= size_total
         
         # 添加扩散损失
         diffusion_losses = self.get_diffusion_loss()
-        
-        # 合并损失
-        all_losses = {**original_losses, **diffusion_losses}
-        
-        # 更新总损失
-        all_losses['total_loss'] = (
-            original_losses['total_loss'] + 
-            self.diffusion_weight * diffusion_losses['diffusion_loss'] +
-            self.vq_weight * diffusion_losses['vq_loss']
+        losses.update(diffusion_losses)
+
+        # 计算总损失（原始PaCo损失 + 扩散损失）
+        losses["total_loss"] = (
+            losses["classification_loss"] +
+            config.plane_chamfer_loss_weight * losses["plane_chamfer_loss"] +
+            config.plane_normal_loss_weight * losses["plane_normal_loss"] +
+            config.repulsion_loss_weight * losses["repulsion_loss"] +
+            config.chamfer_norm2_loss_weight * losses["chamfer_norm2_loss"] +
+            self.diffusion_weight * losses["diffusion_loss"] +
+            self.vq_weight * losses["vq_loss"]
         )
-        
-        return all_losses
+
+        return losses

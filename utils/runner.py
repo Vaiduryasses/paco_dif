@@ -143,13 +143,12 @@ def run_trainer(cfg, train_writer=None, val_writer=None):
 
             # Calculate losses and backpropagate
             # 修改：使用模型自带的get_loss方法，自动处理扩散损失
-            if hasattr(base_model.module if cfg.distributed else base_model, 'get_loss'):
-                losses = (base_model.module if cfg.distributed else base_model).get_loss(
+            
+            model = base_model.module if hasattr(base_model, 'module') else base_model
+            if hasattr(model, 'get_loss'):
+                losses = model.get_loss(
                     cfg.loss, ret, class_prob, gt, gt_index, plane, plane_index
                 )
-            else:
-                # 降级到原始损失计算
-                losses = compute_original_loss(cfg.loss, ret, class_prob, gt, gt_index, plane, plane_index)
             
             _loss = losses['total_loss']
             _loss.backward()

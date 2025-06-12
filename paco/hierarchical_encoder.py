@@ -3,8 +3,142 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import List, Dict, Tuple
 from .diffusion_components import VectorQuantizer
-from .paco_pipeline import DGCNN_Grouper, SimpleEncoder, PointTransformerEncoderEntry
+from .paco_pipeline import  SimpleEncoder, PointTransformerEncoderEntry
 
+
+class DGCNN_Grouper(nn.Module):
+    """
+    Dynamic Graph CNN Grouper
+
+    Groups points using DGCNN and applies several convolutional layers to extract features.
+    """
+
+    def __init__(self, k=16):
+        super().__init__()
+        # K must be 16
+        self.k = k
+        self.input_trans = nn.Conv1d(3, 8, 1)
+        self.layer1 = nn.Sequential(
+            nn.Conv2d(16, 32, kernel_size=1, bias=False),
+            nn.GroupNorm(4, 32),
+            nn.LeakyReLU(negative_slope=0.2)
+        )
+        self.layer2 = nn.Sequential(
+            nn.Conv2d(64, 64, kernel_size=1, bias=False),
+            nn.GroupNorm(4, 64),
+            nn.LeakyReLU(negative_slope=0.2)
+        )
+        self.layer3 = nn.Sequential(
+            nn.Conv2d(128, 64, kernel_size=1, bias=False),
+            nn.GroupNorm(4, 64),
+            nn.LeakyReLU(negative_slope=0.2)
+        )
+        self.layer4 = nn.Sequential(
+            nn.Conv2d(128, 128, kernel_size=1, bias=False),
+            nn.GroupNorm(4, 128),
+            nn.LeakyReLU(negative_slope=0.2)
+        )
+        self.num_features = 128
+
+    @staticmethod
+    def fps_downsample(coor, x, normal, plane_idx, num_group):
+        """
+        Farthest point sampling downsample
+
+        Args:
+            coor: Coordinates tensor (B, C, N)
+            x: Feature tensor
+            normal: Normal vectors tensor
+            plane_idx: Plane index tensor
+            num_group: Number of groups
+
+        Returns:
+            new_coor, new_normal, new_x, new_plane_idx after sampling
+        """
+        xyz = coor.transpose(1, 2).contiguous()  # B, N, 3
+        fps_idx = pointnet2_utils.furthest_point_sample(xyz, num_group)
+        combined_x = torch.cat([coor, normal, plane_idx, x], dim=1)
+        new_combined_x = pointnet2_utils.gather_operation(combined_x, fps_idx)
+        new_coor = new_combined_x[:, :3, :]
+        new_normal = new_combined_x[:, 3:6, :]
+        new_plane_idx = new_combined_x[:, 6, :].unsqueeze(1)
+        new_x = new_combined_x[:, 7:, :]
+        return new_coor, new_normal, new_x, new_plane_idx
+
+    def get_graph_feature(self, coor_q, x_q, coor_k, x_k):
+        """
+        Compute graph features using k-NN
+
+        Args:
+            coor_q: Query coordinates tensor
+            x_q: Query feature tensor
+            coor_k: Key coordinates tensor
+            x_k: Key feature tensor
+
+        Returns:
+            Graph feature tensor
+        """
+        k = self.k
+        batch_size = x_k.size(0)
+        num_points_k = x_k.size(2)
+        num_points_q = x_q.size(2)
+
+        with torch.no_grad():
+            idx = knn_point(
+                k,
+                coor_k.transpose(-1, -2).contiguous(),
+                coor_q.transpose(-1, -2).contiguous()
+            )
+            idx = idx.transpose(-1, -2).contiguous()
+            assert idx.shape[1] == k
+            idx_base = torch.arange(0, batch_size, device=x_q.device).view(-1, 1, 1) * num_points_k
+            idx = idx + idx_base
+            idx = idx.view(-1)
+        num_dims = x_k.size(1)
+        x_k = x_k.transpose(2, 1).contiguous()
+        feature = x_k.view(batch_size * num_points_k, -1)[idx, :]
+        feature = feature.view(batch_size, k, num_points_q, num_dims).permute(0, 3, 2, 1).contiguous()
+        x_q = x_q.view(batch_size, num_dims, num_points_q, 1).expand(-1, -1, -1, k)
+        feature = torch.cat((feature - x_q, x_q), dim=1)
+        return feature
+
+    def forward(self, x, num):
+        """
+        Forward pass for grouping
+
+        Args:
+            x: Input tensor with shape (B, N, 7) where 7 corresponds to x,y,z,nx,ny,nz,plane_id
+            num: List with grouping parameters
+
+        Returns:
+            coor, f, normal, plane_idx after grouping
+        """
+        assert x.shape[-1] == 7
+        batch_size, num_points, _ = x.size()
+        x = x.transpose(-1, -2).contiguous()
+        coor, normal, plane_idx = x[:, :3, :], x[:, 3:6, :], x[:, -1, :].unsqueeze(1)
+        f = self.input_trans(coor)
+        f = self.get_graph_feature(coor, f, coor, f)
+        f = self.layer1(f)
+        f = f.max(dim=-1, keepdim=False)[0]
+        coor_q, normal_q, f_q, plane_idx_q = self.fps_downsample(coor, f, normal, plane_idx, num[0])
+        f = self.get_graph_feature(coor_q, f_q, coor, f)
+        f = self.layer2(f)
+        f = f.max(dim=-1, keepdim=False)[0]
+        coor, normal, plane_idx = coor_q, normal_q, plane_idx_q
+        f = self.get_graph_feature(coor, f, coor, f)
+        f = self.layer3(f)
+        f = f.max(dim=-1, keepdim=False)[0]
+        coor_q, normal_q, f_q, plane_idx_q = self.fps_downsample(coor, f, normal, plane_idx, num[0])
+        f = self.get_graph_feature(coor_q, f_q, coor, f)
+        f = self.layer4(f)
+        f = f.max(dim=-1, keepdim=False)[0]
+        coor, normal, plane_idx = coor_q, normal_q, plane_idx_q
+        coor = coor.transpose(-1, -2).contiguous()
+        f = f.transpose(-1, -2).contiguous()
+        normal = normal.transpose(-1, -2).contiguous()
+        plane_idx = plane_idx.transpose(-1, -2).contiguous()
+        return coor, f, normal, plane_idx
 
 class HierarchicalPointEncoder(nn.Module):
     """
